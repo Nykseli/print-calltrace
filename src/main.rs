@@ -82,7 +82,7 @@ fn read_string(pid: Pid, address: AddressType) -> String {
     string
 }
 
-fn run_tracer(child: Pid) -> Result<(), nix::errno::Errno> {
+fn run_tracer(child: Pid, names: &[FnName]) -> Result<(), nix::errno::Errno> {
     // Handle the initial execve
     wait().unwrap();
 
@@ -97,15 +97,23 @@ fn run_tracer(child: Pid) -> Result<(), nix::errno::Errno> {
 
         let regs = ptrace::getregs(child)?;
         let opcode = ptrace::read(child, regs.rip as *mut c_void)?;
+
+        if let Some(fun) = names.iter().find(|n| n.address as u64 == regs.rip) {
+            println!("{:016x} <{}>", regs.rip, fun.name);
+        }
+        // decompile_instr(regs.rip, opcode);
         // Check if syscall
         if opcode & 0xffff == 0x050f {
             // regx.rax == 1 is syscall write
             // rdi == 1 or 2 is stdout or std err. we don't care about writing to files
             if regs.rax == 1 && (regs.rdi == 1 || regs.rdi == 2) {
-                println!(
-                    "Writing output: {}",
-                    read_string(child, regs.rsi as *mut c_void)
-                );
+                let output = read_string(child, regs.rsi as *mut c_void);
+                if output == "Hello, World!2\n" {
+                    println!("[tracer]: Hello, World!2 found!, stopping execution");
+                    return Ok(());
+                }
+            } else if regs.rax == 60 {
+                return Ok(());
             }
         }
     }
@@ -138,7 +146,7 @@ fn main() {
         }
 
         Ok(ForkResult::Parent { child }) => {
-            if let Err(e) = run_tracer(child) {
+            if let Err(e) = run_tracer(child, &names) {
                 println!("Tracer failed: '{:?}'", e);
             }
         }
