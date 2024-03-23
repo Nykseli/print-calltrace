@@ -1,4 +1,5 @@
 use byteorder::{LittleEndian, WriteBytesExt};
+use goblin::elf::header::ET_DYN;
 use goblin::elf::section_header::{SHT_DYNSYM, SHT_PROGBITS, SHT_SYMTAB};
 use goblin::elf::{self};
 use goblin::Object;
@@ -31,8 +32,6 @@ fn parse_elf(elf: &elf::Elf) -> Vec<FnName> {
                 println!("dynsym not implemented yet")
             }
             SHT_SYMTAB => {
-                /*  let dyn_start = shdr.sh_offset;
-                let dyn_end = dyn_start + shdr.sh_size; */
                 for sym in elf.syms.iter() {
                     if sym.st_name != 0 {
                         let sym_val = elf.strtab.get_at(sym.st_name).expect("Malformed symname");
@@ -82,7 +81,35 @@ fn read_string(pid: Pid, address: AddressType) -> String {
     string
 }
 
-fn run_tracer(child: Pid, names: &[FnName]) -> Result<(), nix::errno::Errno> {
+fn get_process_memmaps(pid: Pid, name: &str) -> Vec<u64> {
+    let mut maps = Vec::new();
+
+    let output = Command::new("cat")
+        .arg(format!("/proc/{pid}/maps"))
+        .output()
+        .unwrap();
+    let out = String::from_utf8(output.stdout).expect("Linux output should be utf8");
+    let mem_lines = out.lines();
+
+    for line in mem_lines {
+        if line.contains(name) {
+            let mem_start = line.split(' ').next().unwrap().split('-').next().unwrap();
+            let mem_num = u64::from_str_radix(mem_start, 16).unwrap();
+            maps.push(mem_num);
+        }
+    }
+
+    maps
+}
+
+fn run_tracer(
+    child: Pid,
+    name: &str,
+    names: &[FnName],
+    is_dyn: bool,
+) -> Result<(), nix::errno::Errno> {
+    let mems = get_process_memmaps(child, name);
+
     // Handle the initial execve
     wait().unwrap();
 
@@ -98,10 +125,18 @@ fn run_tracer(child: Pid, names: &[FnName]) -> Result<(), nix::errno::Errno> {
         let regs = ptrace::getregs(child)?;
         let opcode = ptrace::read(child, regs.rip as *mut c_void)?;
 
-        if let Some(fun) = names.iter().find(|n| n.address as u64 == regs.rip) {
+        if is_dyn {
+            for mem in &mems {
+                for name in names {
+                    if regs.rip == mem + name.address as u64 {
+                        println!("{mem:016x} {:016x} <{}>", regs.rip, name.name);
+                    }
+                }
+            }
+        } else if let Some(fun) = names.iter().find(|n| n.address as u64 == regs.rip) {
             println!("{:016x} <{}>", regs.rip, fun.name);
         }
-        // decompile_instr(regs.rip, opcode);
+
         // Check if syscall
         if opcode & 0xffff == 0x050f {
             // regx.rax == 1 is syscall write
@@ -130,6 +165,7 @@ fn run_tracee(command: &str) {
 
 fn main() {
     let args = env::args().collect::<Vec<String>>();
+
     let path = Path::new(args[1].as_str());
     let buffer = fs::read(path).unwrap();
     let elf = if let Object::Elf(elf) = Object::parse(&buffer).unwrap() {
@@ -146,7 +182,7 @@ fn main() {
         }
 
         Ok(ForkResult::Parent { child }) => {
-            if let Err(e) = run_tracer(child, &names) {
+            if let Err(e) = run_tracer(child, &args[1], &names, elf.header.e_type == ET_DYN) {
                 println!("Tracer failed: '{:?}'", e);
             }
         }
