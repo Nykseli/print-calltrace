@@ -8,6 +8,7 @@ use linux_personality::personality;
 use nix::sys::ptrace::{self, AddressType};
 use nix::sys::wait::wait;
 use nix::unistd::{fork, ForkResult, Pid};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::os::unix::process::CommandExt;
@@ -16,7 +17,7 @@ use std::process::{exit, Command};
 
 #[derive(Debug)]
 struct FnName {
-    address: usize,
+    address: u64,
     name: String,
 }
 
@@ -36,7 +37,7 @@ fn parse_elf(elf: &elf::Elf) -> Vec<FnName> {
                     if sym.st_name != 0 {
                         let sym_val = elf.strtab.get_at(sym.st_name).expect("Malformed symname");
                         names.push(FnName {
-                            address: sym.st_value as usize,
+                            address: sym.st_value,
                             name: sym_val.into(),
                         })
                     }
@@ -109,6 +110,18 @@ fn run_tracer(
     is_dyn: bool,
 ) -> Result<(), nix::errno::Errno> {
     let mems = get_process_memmaps(child, name);
+    let mut mem_map: HashMap<u64, String> = HashMap::new();
+    for name in names {
+        // If elf is dyn, not exec, addresses are relative to memmaps
+        let rel_addr = if is_dyn {
+            name.address + mems[0]
+        } else {
+            // else the address point to the actual memory location
+            name.address
+        };
+
+        mem_map.insert(rel_addr, name.name.clone());
+    }
 
     // Handle the initial execve
     wait().unwrap();
@@ -125,16 +138,8 @@ fn run_tracer(
         let regs = ptrace::getregs(child)?;
         let opcode = ptrace::read(child, regs.rip as *mut c_void)?;
 
-        if is_dyn {
-            for mem in &mems {
-                for name in names {
-                    if regs.rip == mem + name.address as u64 {
-                        println!("{mem:016x} {:016x} <{}>", regs.rip, name.name);
-                    }
-                }
-            }
-        } else if let Some(fun) = names.iter().find(|n| n.address as u64 == regs.rip) {
-            println!("{:016x} <{}>", regs.rip, fun.name);
+        if let Some(name) = mem_map.get(&regs.rip) {
+            println!("{:016x} <{}>", regs.rip, name);
         }
 
         // Check if syscall
